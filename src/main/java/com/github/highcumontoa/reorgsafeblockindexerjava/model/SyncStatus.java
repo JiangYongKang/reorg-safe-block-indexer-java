@@ -14,6 +14,8 @@ public enum SyncStatus {
     BUSY_SKIPPED,
     /** 投递被拒绝：高度跳跃/无法接到当前链上，未产生任何写入 */
     REJECTED,
+    /** 同高度可用的数据源之间内容互相矛盾（同高分歧），本地保持不动 */
+    SOURCES_DIVERGED,
     /** 所有数据源均不可用 */
     ALL_SOURCES_UNAVAILABLE
 }

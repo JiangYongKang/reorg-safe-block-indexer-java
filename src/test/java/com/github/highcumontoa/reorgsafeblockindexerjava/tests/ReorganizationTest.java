@@ -70,24 +70,45 @@ class ReorganizationTest {
     }
 
     @Test
-    void equalLengthForkIsNotApplied() {
-        // 等长分叉：水位不允许倒退，必须拒绝且给出 BUSINESS 归因
+    void equalLengthForkAtSameWatermarkIsSwitchedAtomically() {
+        // 单一来源在同一水位给出另一条等长链：不再当“已同步”跳过，
+        // 而是按一次链切换处理——回滚作废段、重放新链；水位不变，提交原子。
         LocalBlockSource source = new LocalBlockSource("equal-fork-source");
-        BlockIndexer indexer = new BlockIndexer(List.of(source), new IndexStore());
+        IndexStore store = new IndexStore();
+        BlockIndexer indexer = new BlockIndexer(List.of(source), store);
 
         List<Block> chainA = TestChains.chain("A", 4, "ROOT");
         source.replaceChain(chainA);
         indexer.sync();
 
+        // 分叉点在高度 2，新链 C 与旧链 A 等长（均到高度 3）
         List<Block> fork = TestChains.forkAfter(chainA, 2, "C");
         source.replaceChain(fork);
 
         SyncResult result = indexer.sync();
-        log.info("[reorg] 等长分叉结论：状态={}，尝试明细={}",
-                result.status(), result.attempts());
-        assertThat(result.status()).isEqualTo(SyncStatus.ALL_SOURCES_UNAVAILABLE);
-        assertThat(result.attempts()).hasSize(1);
-        assertThat(result.attempts().get(0).failureKind()).isEqualTo("BUSINESS");
-        assertThat(indexer.snapshot().blocks()).containsExactlyElementsOf(chainA);
+        log.info("[reorg] 同水位链切换：状态={}，水位 {} -> {}，回滚哈希={}，重放哈希={}",
+                result.status(), result.watermarkBefore(), result.watermarkAfter(),
+                result.rolledBackHashes(), result.appliedHashes());
+
+        assertThat(result.status()).isEqualTo(SyncStatus.REORGANIZED);
+        assertThat(result.watermarkBefore()).isEqualTo(3);
+        assertThat(result.watermarkAfter()).isEqualTo(3); // 等长切换：水位不增不减
+        assertThat(result.rollbackFromHeight()).isEqualTo(2);
+        assertThat(result.rolledBackHashes()).containsExactly("A-h2", "A-h3");
+        assertThat(result.appliedHashes()).containsExactly("C-h2", "C-h3");
+
+        // 本地已完全切到新链，旧哈希查不到
+        assertThat(indexer.snapshot().blocks()).containsExactlyElementsOf(fork);
+        assertThat(store.blockAtHeight(2).orElseThrow().hash()).isEqualTo("C-h2");
+        assertThat(store.blockByHash("A-h2")).isEmpty();
+        assertThat(store.blockByHash("C-h2")).isPresent();
+
+        // 再同步一次：等长且完全一致 -> 幂等，不重复回滚/重放
+        SyncResult again = indexer.sync();
+        log.info("[reorg] 切换后重复同步：状态={}，水位={}", again.status(), again.watermarkAfter());
+        assertThat(again.status()).isEqualTo(SyncStatus.ALREADY_SYNCED);
+        assertThat(again.rolledBackHashes()).isEmpty();
+        assertThat(again.appliedHashes()).isEmpty();
+        assertThat(again.watermarkAfter()).isEqualTo(3);
     }
 }

@@ -13,7 +13,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -24,12 +26,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * <ol>
  *   <li><b>串行变更</b>：sync 与 submitBlock 共用一把互斥锁；sync 用 tryLock，
  *       并发触发只有一个真正执行，其余得到 {@link SyncStatus#BUSY_SKIPPED}。</li>
- *   <li><b>先拉取后提交</b>：从某个数据源拉取全部所需区块成功之前不写任何状态；
- *       中途失败仅放弃该源并尝试下一个源，本地无部分写入。</li>
+ *   <li><b>先拉取后提交</b>：从各候选源整链取数并形成跨源共识之前不写任何状态；
+ *       某个源中途失败仅排除该源，来源分歧则不提交，本地无部分写入。</li>
  *   <li><b>重组原子化</b>：检测分叉点后，回滚与重放在存储层的私有草稿上一次完成，
  *       CAS 整体替换快照；对外查询永远不会看到中间态。</li>
- *   <li><b>水位单调</b>：仅接受严格长于本地链的源；等长分叉与落后源被拒绝，
- *       重复同步得到 {@link SyncStatus#ALREADY_SYNCED}。</li>
+ *   <li><b>同高分歧不盲选</b>：多个最高高度相同的来源必须在<b>每一个高度</b>上哈希一致才算
+ *       “同一条链”；只要存在分歧就返回 {@link SyncStatus#SOURCES_DIVERGED}，不采用任何来源，
+ *       本地保持不动，等来源重新一致后再推进。</li>
+ *   <li><b>等长链按重组切换</b>：来源一致链与本地<b>等长但内容不同</b>时，不做幂等跳过，
+ *       而是按一次链切换处理——回滚作废段、重放共识链；水位不增不减，提交仍然原子。
+ *       仅当来源一致链严格短于本地（全部来源落后）时才拒绝。</li>
  *   <li><b>失败可解释</b>：TIMEOUT / TRANSPORT / BUSINESS 三类错误分别记录来源，
  *       全部源失败时返回 {@link SyncStatus#ALL_SOURCES_UNAVAILABLE} 及逐源尝试明细。</li>
  * </ol>
@@ -67,10 +73,9 @@ public class BlockIndexer {
         long before = snap.watermark();
         log.info("开始同步：当前水位={}，候选数据源={}", before, sourceNames());
 
-        // 阶段一：向所有源探测链头高度。源间高度不一致时，只有最高高度的源可作为候选，
-        // 落后源记为能力不足（BUSINESS），避免低高度/分叉数据污染本地状态。
-        java.util.Map<String, Long> heights = new java.util.HashMap<>();
-        java.util.Map<String, SourceAttempt> probeFailures = new java.util.LinkedHashMap<>();
+        // 阶段一：向所有源探测链头高度。
+        Map<String, Long> heights = new LinkedHashMap<>();
+        Map<String, SourceAttempt> probeFailures = new LinkedHashMap<>();
         long maxHeight = Long.MIN_VALUE;
         for (BlockSource src : sources) {
             try {
@@ -85,10 +90,8 @@ public class BlockIndexer {
             }
         }
 
-        // 按配置优先级逐源占位：探测失败 / 高度落后的源立即给出结论，
-        // 其余进入尝试阶段。槽位与源一一对应，保证结果严格按优先级顺序呈现。
+        // 槽位与源一一对应，保证 attempts 严格按配置优先级呈现。
         List<SourceAttempt> attempts = new ArrayList<>();
-        List<Integer> candidateSlots = new ArrayList<>();
         List<BlockSource> candidates = new ArrayList<>();
         for (BlockSource src : sources) {
             int slot = attempts.size();
@@ -106,94 +109,133 @@ public class BlockIndexer {
                 log.warn("数据源 [{}] 能力不足：高度 {} < 最高高度 {}", src.name(), h, maxHeight);
             } else {
                 candidates.add(src);
-                candidateSlots.add(slot);
             }
         }
 
-        // 阶段二：按优先级在最高高度候选源上依次尝试完整取数 + 原子提交。
-        for (int i = 0; i < candidates.size(); i++) {
-            BlockSource src = candidates.get(i);
-            int slot = candidateSlots.get(i);
+        if (candidates.isEmpty()) {
+            return allUnavailable(before, attempts, "所有数据源探测均失败");
+        }
+
+        // 阶段二：从每个最高高度候选源整链取数（先拉取后提交，中途失败不写本地）。
+        // 取数成功的源按“每个高度的哈希序列”分组；序列完全相同才是同一条链。
+        Map<List<String>, List<BlockSource>> groups = new LinkedHashMap<>();
+        Map<BlockSource, List<Block>> fetchedBySource = new LinkedHashMap<>();
+        for (BlockSource src : candidates) {
+            int slot = findSlot(attempts, src);
             try {
-                return attemptSync(src, snap, before, attempts, slot, maxHeight);
+                List<Block> chain = fetchFullChain(src, maxHeight);
+                fetchedBySource.put(src, chain);
+                groups.computeIfAbsent(hashesOf(chain), k -> new ArrayList<>()).add(src);
+                attempts.set(slot, null); // 共识结论阶段再回填
             } catch (BlockSourceException e) {
                 attempts.set(slot, new SourceAttempt(src.name(), false, e.kind(), e.getMessage()));
-                log.warn("数据源 [{}] 同步失败：kind={}，原因={}（无任何本地写入）",
+                log.warn("数据源 [{}] 取数失败：kind={}，原因={}（无任何本地写入）",
                         src.name(), e.kind(), e.getMessage());
             }
         }
 
-        SyncResult fail = new SyncResult(SyncStatus.ALL_SOURCES_UNAVAILABLE, before, before, -1,
-                List.of(), List.of(), List.copyOf(attempts),
-                "所有数据源均不可用: " + summarize(attempts));
-        log.error("同步失败：水位保持={}，逐源结论={}", before, summarize(attempts));
-        return fail;
+        // 阶段三：来源之间在同一高度给出不同链——不挑任何一边，本地保持原样。
+        if (groups.size() > 1) {
+            return buildDivergence(before, maxHeight, groups, fetchedBySource, attempts);
+        }
+        if (groups.isEmpty()) {
+            return allUnavailable(before, attempts, "所有数据源取数均失败");
+        }
+
+        // 唯一一组 = 来源共识链。成功标记在 applyConsensus 真正成功的返回点回填，
+        // 若共识链因落后被拒绝，这些槽位要改填 BUSINESS，不能提前记成功。
+        Map.Entry<List<String>, List<BlockSource>> consensus = groups.entrySet().iterator().next();
+        List<BlockSource> agreeing = consensus.getValue();
+        List<Block> canonical = fetchedBySource.get(agreeing.get(0));
+        return applyConsensus(agreeing, snap, before, canonical, maxHeight, attempts);
     }
 
-    private SyncResult attemptSync(BlockSource src, ChainSnapshot snap, long before,
-                                   List<SourceAttempt> attempts, int slot, long head)
-            throws BlockSourceException {
+    /**
+     * 把来源共识链与本地链比对并原子提交：
+     * <ul>
+     *   <li>共识链严格短于本地（全部来源落后）：拒绝，不允许水位倒退；</li>
+     *   <li>等长且完全一致：ALREADY_SYNCED；</li>
+     *   <li>等长但内容不同（含深度分叉）：REORGANIZED，回滚作废段并重放共识链；</li>
+     *   <li>更长：定位分叉点，追加或重组推进。</li>
+     * </ul>
+     */
+    private SyncResult applyConsensus(List<BlockSource> agreeing, ChainSnapshot snap, long before,
+                                      List<Block> canonical, long head,
+                                      List<SourceAttempt> attempts) {
+        BlockSource chosen = agreeing.get(0);
         if (head < before) {
-            throw new SourceBusinessException("源高度 " + head + " 落后于本地水位 " + before
-                    + "，能力不足，跳过该源");
+            for (int i = 0; i < attempts.size(); i++) {
+                if (attempts.get(i) == null) {
+                    BlockSource src = sources.get(i);
+                    attempts.set(i, new SourceAttempt(src.name(), false, "BUSINESS",
+                            "共识链高度 " + head + " 落后于本地水位 " + before
+                                    + "，不允许水位倒退"));
+                }
+            }
+            return allUnavailable(before, attempts,
+                    "来源一致链高度 " + head + " 落后于本地水位 " + before + "，拒绝切换");
         }
-        if (head == before) {
-            // 高度持平：必须确认是同一条链，等长分叉不重放（最长链规则 + 水位单调）。
-            if (before == -1) {
-                attempts.set(slot, new SourceAttempt(src.name(), true, null, "空链已同步"));
-                return new SyncResult(SyncStatus.ALREADY_SYNCED, before, before, -1,
-                        List.of(), List.of(), List.copyOf(attempts), "本地与源均为空链");
-            }
-            Block sourceTip = requireBlock(src, before);
-            Block localTip = snap.blocks().get((int) before);
-            if (!sourceTip.hash().equals(localTip.hash())) {
-                throw new SourceBusinessException("源在水位 " + before
-                        + " 处为等长分叉（tip=" + sourceTip.hash() + "），不重放等长链");
-            }
-            attempts.set(slot, new SourceAttempt(src.name(), true, null,
-                    "head=" + head + " 已同步"));
-            log.info("同步幂等跳过：水位={}，tip={}", before, localTip.hash());
+
+        if (before == -1 && head == before) {
+            log.info("同步幂等跳过：本地与来源共识均为空链");
+            markAgreeingSources(agreeing, attempts, "空链已同步");
             return new SyncResult(SyncStatus.ALREADY_SYNCED, before, before, -1,
-                    List.of(), List.of(), List.copyOf(attempts),
-                    "水位 " + before + " 已与源一致");
+                    List.of(), List.of(), List.copyOf(attempts), "本地与源均为空链");
         }
 
-        // head > before：向源方向回溯，定位共同祖先。
-        long forkHeight = locateForkHeight(src, snap, before);
-
-        // 拉取 (forkHeight, head] 的完整新区段；任何缺失/异常都在提交前抛出，无部分写入。
-        List<Block> incoming = new ArrayList<>();
-        for (long h = forkHeight; h <= head; h++) {
-            incoming.add(requireBlock(src, h));
-        }
+        // 等长或更长都一样：从本地水位沿高度向下与共识链逐块比对哈希，定位共同祖先。
+        // 等长且全部一致时返回 before+1：回滚段与重放段都为空 -> 幂等跳过。
+        long forkHeight = before < 0 ? 0L : locateForkHeight(canonical, snap, before);
 
         List<String> rolledBack = new ArrayList<>();
         for (long h = forkHeight; h <= before; h++) {
             rolledBack.add(snap.blocks().get((int) h).hash());
         }
-        List<String> applied = incoming.stream().map(Block::hash).toList();
+        List<Block> incoming = canonical.subList((int) forkHeight, canonical.size());
+        List<String> applied = hashesOf(incoming);
+
+        // 等长但内容一致：没有任何需要回滚或重放的区块。
+        boolean identical = rolledBack.isEmpty() && applied.isEmpty();
+        if (identical) {
+            log.info("同步幂等跳过：水位={}，tip={}", before,
+                    snap.blocks().get((int) before).hash());
+            markAgreeingSources(agreeing, attempts, "head=" + head + " 已同步");
+            return new SyncResult(SyncStatus.ALREADY_SYNCED, before, before, -1,
+                    List.of(), List.of(), List.copyOf(attempts),
+                    "水位 " + before + " 已与来源共识一致");
+        }
 
         ChainSnapshot next = store.commit(snap, forkHeight, incoming)
                 .orElseThrow(() -> new IllegalStateException(
                         "快照 CAS 提交失败：锁内不应发生，请检查存储实现"));
 
-        SyncStatus status = forkHeight <= before ? SyncStatus.REORGANIZED : SyncStatus.ADVANCED;
-        attempts.set(slot, new SourceAttempt(src.name(), true, null,
-                "head=" + head + ", forkHeight=" + forkHeight));
+        markAgreeingSources(agreeing, attempts,
+                "head=" + head + ", forkHeight=" + forkHeight);
 
-        if (status == SyncStatus.REORGANIZED) {
-            log.info("链重组已提交：数据源={}，水位 {} -> {}，回滚高度区间=[{}, {}]，"
-                            + "回滚哈希={}，重放哈希={}",
-                    src.name(), before, next.watermark(), forkHeight, before, rolledBack, applied);
-        } else {
-            log.info("同步推进已提交：数据源={}，水位 {} -> {}，新增哈希={}",
-                    src.name(), before, next.watermark(), applied);
+        SyncStatus status = SyncStatus.REORGANIZED;
+        if (head > before && forkHeight > before) {
+            status = SyncStatus.ADVANCED; // 纯追加
         }
 
-        String msg = status == SyncStatus.REORGANIZED
-                ? "在高度 " + forkHeight + " 分叉，已回滚 " + rolledBack.size()
-                + " 个区块并重放 " + applied.size() + " 个区块"
-                : "新增 " + applied.size() + " 个区块";
+        if (status == SyncStatus.REORGANIZED) {
+            log.info("链切换/重组已提交：数据源={}，水位 {} -> {}，回滚高度区间=[{}, {}]，"
+                            + "回滚哈希={}，重放哈希={}",
+                    chosen.name(), before, next.watermark(), forkHeight, before, rolledBack, applied);
+        } else {
+            log.info("同步推进已提交：数据源={}，水位 {} -> {}，新增哈希={}",
+                    chosen.name(), before, next.watermark(), applied);
+        }
+
+        String msg;
+        if (head == before) {
+            msg = "来源在同一水位 " + before + " 给出不同链，已按链切换回滚 "
+                    + rolledBack.size() + " 个区块并重放 " + applied.size() + " 个区块";
+        } else if (status == SyncStatus.REORGANIZED) {
+            msg = "在高度 " + forkHeight + " 分叉，已回滚 " + rolledBack.size()
+                    + " 个区块并重放 " + applied.size() + " 个区块";
+        } else {
+            msg = "新增 " + applied.size() + " 个区块";
+        }
         return new SyncResult(status, before, next.watermark(),
                 status == SyncStatus.REORGANIZED ? forkHeight : -1,
                 List.copyOf(rolledBack), List.copyOf(applied),
@@ -201,18 +243,113 @@ public class BlockIndexer {
     }
 
     /**
-     * 从本地水位沿高度向下与源比对哈希，返回首个不一致高度（即分叉后第一块的高度）。
-     * 若全部一致（纯追加），返回 before + 1；创世即分叉返回 0。
+     * 形成 SOURCES_DIVERGED 结论：按配置顺序取第一组为基准，逐高度定位首个分歧点，
+     * 回填每个候选源的尝试明细。结论确定、可重复，本地不发生任何写入。
      */
-    private long locateForkHeight(BlockSource src, ChainSnapshot snap, long before)
-            throws BlockSourceException {
-        for (long h = before; h >= 0; h--) {
-            Block sourceBlock = requireBlock(src, h);
-            Block localBlock = snap.blocks().get((int) h);
-            if (!sourceBlock.hash().equals(localBlock.hash())) {
-                continue;
+    private SyncResult buildDivergence(long before, long head,
+                                       Map<List<String>, List<BlockSource>> groups,
+                                       Map<BlockSource, List<Block>> fetchedBySource,
+                                       List<SourceAttempt> attempts) {
+        List<Block> anchorChain = fetchedBySource.get(groups.values().iterator().next().get(0));
+        long firstDiff = -1;
+        for (long h = 0; h <= head; h++) {
+            String anchorHash = anchorChain.get((int) h).hash();
+            for (List<Block> chain : fetchedBySource.values()) {
+                if (!chain.get((int) h).hash().equals(anchorHash)) {
+                    firstDiff = h;
+                    break;
+                }
             }
-            return h + 1;
+            if (firstDiff >= 0) {
+                break;
+            }
+        }
+
+        for (Map.Entry<List<String>, List<BlockSource>> group : groups.entrySet()) {
+            List<Block> chain = fetchedBySource.get(group.getValue().get(0));
+            boolean anchor = chain == anchorChain;
+            String detail = (anchor ? "同高分歧基准链：首个分歧高度=" + firstDiff
+                    : "与基准链在高度 " + firstDiff + " 处哈希不同")
+                    + "，tip=" + chain.get((int) head).hash();
+            for (BlockSource src : group.getValue()) {
+                int slot = findSlot(attempts, src);
+                attempts.set(slot, new SourceAttempt(src.name(), false, "DIVERGENCE", detail));
+            }
+        }
+
+        String names = summarize(attempts);
+        String message = "最高高度均为 " + head + " 的数据源在高度 " + firstDiff
+                + " 处内容互相矛盾，无法判定规范链，本地保持水位 " + before + " 不动: " + names;
+        log.warn("数据源之间同高分歧：首个分歧高度={}，水位保持={}，逐源结论={}",
+                firstDiff, before, names);
+        return new SyncResult(SyncStatus.SOURCES_DIVERGED, before, before, -1,
+                List.of(), List.of(), List.copyOf(attempts), message);
+    }
+
+    private void markAgreeingSources(List<BlockSource> agreeing, List<SourceAttempt> attempts,
+                                     String baseDetail) {
+        for (int i = 0; i < agreeing.size(); i++) {
+            BlockSource src = agreeing.get(i);
+            int slot = findSlot(attempts, src);
+            String detail = i == 0 ? baseDetail : baseDetail + "；与共识链逐高度一致";
+            attempts.set(slot, new SourceAttempt(src.name(), true, null, detail));
+        }
+    }
+
+    private int findSlot(List<SourceAttempt> attempts, BlockSource src) {
+        for (int i = 0; i < sources.size(); i++) {
+            if (sources.get(i).name().equals(src.name())) {
+                return i;
+            }
+        }
+        throw new IllegalStateException("未知数据源: " + src.name());
+    }
+
+    private SyncResult allUnavailable(long before, List<SourceAttempt> attempts, String reason) {
+        SyncResult fail = new SyncResult(SyncStatus.ALL_SOURCES_UNAVAILABLE, before, before, -1,
+                List.of(), List.of(), List.copyOf(attempts),
+                reason + ": " + summarize(attempts));
+        log.error("同步失败：水位保持={}，逐源结论={}", before, summarize(attempts));
+        return fail;
+    }
+
+    /**
+     * 从来源整链取 [0, head]，并在内存中校验高度连续、父子相接。
+     * 任何缺失/异常/不自洽都在提交前抛出，调用方放弃该源，本地零写入。
+     */
+    private List<Block> fetchFullChain(BlockSource src, long head) throws BlockSourceException {
+        List<Block> chain = new ArrayList<>();
+        String expectedParent = null;
+        for (long h = 0; h <= head; h++) {
+            Block block = requireBlock(src, h);
+            if (h > 0 && !block.parentHash().equals(expectedParent)) {
+                throw new SourceBusinessException(src.name() + ": 高度 " + h
+                        + " 的区块未接在高度 " + (h - 1) + " 之后（父哈希不匹配），源链不自洽");
+            }
+            chain.add(block);
+            expectedParent = block.hash();
+        }
+        return List.copyOf(chain);
+    }
+
+    private List<String> hashesOf(List<Block> blocks) {
+        List<String> hashes = new ArrayList<>(blocks.size());
+        for (Block b : blocks) {
+            hashes.add(b.hash());
+        }
+        return List.copyOf(hashes);
+    }
+
+    /**
+     * 从本地水位沿高度向下与已取回的共识链比对哈希，返回首个不一致高度
+     * （即分叉后第一块的高度）。全部一致（纯追加/完全相同）返回 before + 1；
+     * 创世即分叉返回 0。
+     */
+    private long locateForkHeight(List<Block> canonical, ChainSnapshot snap, long before) {
+        for (long h = Math.min(before, canonical.size() - 1L); h >= 0; h--) {
+            if (canonical.get((int) h).hash().equals(snap.blocks().get((int) h).hash())) {
+                return h + 1;
+            }
         }
         return 0;
     }
