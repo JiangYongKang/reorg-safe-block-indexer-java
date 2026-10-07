@@ -70,8 +70,8 @@ class ReorganizationTest {
     }
 
     @Test
-    void equalLengthForkIsNotApplied() {
-        // 等长分叉：水位不允许倒退，必须拒绝且给出 BUSINESS 归因
+    void equalLengthForkIsHandledAsChainSwitch() {
+        // 等长不同链：按一次链切换处理——回滚失效段、重放新规范链，水位保持不变
         LocalBlockSource source = new LocalBlockSource("equal-fork-source");
         BlockIndexer indexer = new BlockIndexer(List.of(source), new IndexStore());
 
@@ -83,11 +83,21 @@ class ReorganizationTest {
         source.replaceChain(fork);
 
         SyncResult result = indexer.sync();
-        log.info("[reorg] 等长分叉结论：状态={}，尝试明细={}",
-                result.status(), result.attempts());
-        assertThat(result.status()).isEqualTo(SyncStatus.ALL_SOURCES_UNAVAILABLE);
-        assertThat(result.attempts()).hasSize(1);
-        assertThat(result.attempts().get(0).failureKind()).isEqualTo("BUSINESS");
-        assertThat(indexer.snapshot().blocks()).containsExactlyElementsOf(chainA);
+        log.info("[reorg] 等长链切换结论：状态={}，回滚自高度={}，回滚哈希={}，重放哈希={}，水位={}",
+                result.status(), result.rollbackFromHeight(),
+                result.rolledBackHashes(), result.appliedHashes(), result.watermarkAfter());
+
+        assertThat(result.status()).isEqualTo(SyncStatus.CHAIN_SWITCHED);
+        assertThat(result.rollbackFromHeight()).isEqualTo(2);
+        assertThat(result.rolledBackHashes()).containsExactly("A-h2", "A-h3");
+        assertThat(result.appliedHashes()).containsExactly("C-h2", "C-h3");
+        // 水位不回退也不虚增：保持 3
+        assertThat(result.watermarkAfter()).isEqualTo(3);
+        assertThat(indexer.snapshot().blocks()).containsExactlyElementsOf(fork);
+
+        // 切换后重复同步幂等
+        SyncResult again = indexer.sync();
+        assertThat(again.status()).isEqualTo(SyncStatus.ALREADY_SYNCED);
+        assertThat(again.watermarkAfter()).isEqualTo(3);
     }
 }

@@ -28,8 +28,14 @@ import java.util.concurrent.locks.ReentrantLock;
  *       中途失败仅放弃该源并尝试下一个源，本地无部分写入。</li>
  *   <li><b>重组原子化</b>：检测分叉点后，回滚与重放在存储层的私有草稿上一次完成，
  *       CAS 整体替换快照；对外查询永远不会看到中间态。</li>
- *   <li><b>水位单调</b>：仅接受严格长于本地链的源；等长分叉与落后源被拒绝，
+ *   <li><b>水位单调</b>：仅接受不短于本地链的源；落后源被拒绝，
  *       重复同步得到 {@link SyncStatus#ALREADY_SYNCED}。</li>
+ *   <li><b>等长链切换</b>：源在与本地水位相同的高度给出不同的链时，按一次链切换处理：
+ *       定位分叉点、回滚失效段、顺序重放新规范链，水位保持不变，得到
+ *       {@link SyncStatus#CHAIN_SWITCHED}；切换仍是原子提交，对外只见完整老链或完整新链。</li>
+ *   <li><b>源间分歧不落地</b>：多个可用源在最高高度给出互相矛盾的 tip 时，
+ *       不挑选任何一方，本地保持原样，返回 {@link SyncStatus#SOURCES_DIVERGED}
+ *       及每个源各自看到的 tip；待源恢复一致后即可继续推进。</li>
  *   <li><b>失败可解释</b>：TIMEOUT / TRANSPORT / BUSINESS 三类错误分别记录来源，
  *       全部源失败时返回 {@link SyncStatus#ALL_SOURCES_UNAVAILABLE} 及逐源尝试明细。</li>
  * </ol>
@@ -110,6 +116,16 @@ public class BlockIndexer {
             }
         }
 
+        // 阶段一·五：同高候选源之间的一致性检查。多个可用源在最高高度给出不同的 tip，
+        // 说明源之间自己就对不上：不挑选任何一方，本地保持原样，返回 SOURCES_DIVERGED。
+        if (candidates.size() >= 2 && maxHeight >= 0 && maxHeight >= before) {
+            SyncResult diverged = checkSourceConsensus(
+                    candidates, candidateSlots, attempts, before, maxHeight);
+            if (diverged != null) {
+                return diverged;
+            }
+        }
+
         // 阶段二：按优先级在最高高度候选源上依次尝试完整取数 + 原子提交。
         for (int i = 0; i < candidates.size(); i++) {
             BlockSource src = candidates.get(i);
@@ -124,10 +140,83 @@ public class BlockIndexer {
         }
 
         SyncResult fail = new SyncResult(SyncStatus.ALL_SOURCES_UNAVAILABLE, before, before, -1,
-                List.of(), List.of(), List.copyOf(attempts),
+                List.of(), List.of(), finalizedAttempts(attempts),
                 "所有数据源均不可用: " + summarize(attempts));
         log.error("同步失败：水位保持={}，逐源结论={}", before, summarize(attempts));
         return fail;
+    }
+
+    /**
+     * 源间一致性检查：向每个同高候选源取最高高度处的 tip 块并比对哈希。
+     *
+     * <ul>
+     *   <li>取 tip 失败的源记为对应失败类别，不参与一致性判定（按故障切换语义处理）；</li>
+     *   <li>其余源 tip 全部一致（或只剩一个可达源）时返回 null，继续常规同步流程；</li>
+     *   <li>出现两种及以上 tip 时返回 {@link SyncStatus#SOURCES_DIVERGED}：
+     *       每个分歧源的结论里都写明各自的 tip 与对立阵营，本地不写任何数据。</li>
+     * </ul>
+     */
+    private SyncResult checkSourceConsensus(List<BlockSource> candidates,
+                                            List<Integer> candidateSlots,
+                                            List<SourceAttempt> attempts,
+                                            long before, long head) {
+        java.util.Map<String, String> tipBySource = new java.util.LinkedHashMap<>();
+        List<String> reachable = new ArrayList<>();
+        List<Integer> reachableSlots = new ArrayList<>();
+        for (int i = 0; i < candidates.size(); i++) {
+            BlockSource src = candidates.get(i);
+            int slot = candidateSlots.get(i);
+            try {
+                Block tip = requireBlock(src, head);
+                tipBySource.put(src.name(), tip.hash());
+                reachable.add(src.name());
+                reachableSlots.add(slot);
+            } catch (BlockSourceException e) {
+                attempts.set(slot, new SourceAttempt(src.name(), false, e.kind(), e.getMessage()));
+                log.warn("数据源 [{}] 一致性检查取 tip 失败：kind={}，原因={}（无任何本地写入）",
+                        src.name(), e.kind(), e.getMessage());
+            }
+        }
+
+        // 按 tip 哈希分组：hash -> 持有该 tip 的源名列表
+        java.util.Map<String, List<String>> campsByHash = new java.util.LinkedHashMap<>();
+        for (String name : reachable) {
+            campsByHash.computeIfAbsent(tipBySource.get(name), k -> new ArrayList<>()).add(name);
+        }
+        if (campsByHash.size() <= 1) {
+            return null;
+        }
+
+        // 分歧：为每个可达源给出“自己看到的 tip + 对立阵营”的可读结论
+        for (int i = 0; i < reachable.size(); i++) {
+            String name = reachable.get(i);
+            String tip = tipBySource.get(name);
+            StringBuilder opponents = new StringBuilder();
+            for (var entry : campsByHash.entrySet()) {
+                if (!entry.getKey().equals(tip)) {
+                    if (!opponents.isEmpty()) {
+                        opponents.append("; ");
+                    }
+                    opponents.append(entry.getValue()).append("(tip=").append(entry.getKey()).append(')');
+                }
+            }
+            attempts.set(reachableSlots.get(i), new SourceAttempt(name, false, "DIVERGENT",
+                    "高度 " + head + " 处 tip=" + tip + "，与源 " + opponents
+                            + " 矛盾，未采用任何一方"));
+        }
+
+        StringBuilder summary = new StringBuilder();
+        for (var entry : campsByHash.entrySet()) {
+            if (!summary.isEmpty()) {
+                summary.append(" vs ");
+            }
+            summary.append(entry.getValue()).append("->tip=").append(entry.getKey());
+        }
+        String msg = "数据源在高度 " + head + " 给出互相矛盾的链（" + summary
+                + "），本地水位保持 " + before + "，未写入任何数据；等待源恢复一致后重试";
+        log.error("源间分歧：{}，本地保持原样（水位={}）", summary, before);
+        return new SyncResult(SyncStatus.SOURCES_DIVERGED, before, before, -1,
+                List.of(), List.of(), finalizedAttempts(attempts), msg);
     }
 
     private SyncResult attemptSync(BlockSource src, ChainSnapshot snap, long before,
@@ -138,30 +227,42 @@ public class BlockIndexer {
                     + "，能力不足，跳过该源");
         }
         if (head == before) {
-            // 高度持平：必须确认是同一条链，等长分叉不重放（最长链规则 + 水位单调）。
+            // 高度持平：tip 相同则幂等跳过；tip 不同则按等长链切换处理（水位不变）。
             if (before == -1) {
                 attempts.set(slot, new SourceAttempt(src.name(), true, null, "空链已同步"));
                 return new SyncResult(SyncStatus.ALREADY_SYNCED, before, before, -1,
-                        List.of(), List.of(), List.copyOf(attempts), "本地与源均为空链");
+                        List.of(), List.of(), finalizedAttempts(attempts), "本地与源均为空链");
             }
             Block sourceTip = requireBlock(src, before);
             Block localTip = snap.blocks().get((int) before);
             if (!sourceTip.hash().equals(localTip.hash())) {
-                throw new SourceBusinessException("源在水位 " + before
-                        + " 处为等长分叉（tip=" + sourceTip.hash() + "），不重放等长链");
+                // 等长不同链：按一次链切换处理——回滚失效段、顺序重放新规范链，水位保持不变。
+                long forkHeight = locateForkHeight(src, snap, before);
+                return commitFork(src, snap, before, forkHeight, head,
+                        attempts, slot, SyncStatus.CHAIN_SWITCHED);
             }
             attempts.set(slot, new SourceAttempt(src.name(), true, null,
                     "head=" + head + " 已同步"));
             log.info("同步幂等跳过：水位={}，tip={}", before, localTip.hash());
             return new SyncResult(SyncStatus.ALREADY_SYNCED, before, before, -1,
-                    List.of(), List.of(), List.copyOf(attempts),
+                    List.of(), List.of(), finalizedAttempts(attempts),
                     "水位 " + before + " 已与源一致");
         }
 
         // head > before：向源方向回溯，定位共同祖先。
         long forkHeight = locateForkHeight(src, snap, before);
+        SyncStatus status = forkHeight <= before ? SyncStatus.REORGANIZED : SyncStatus.ADVANCED;
+        return commitFork(src, snap, before, forkHeight, head, attempts, slot, status);
+    }
 
-        // 拉取 (forkHeight, head] 的完整新区段；任何缺失/异常都在提交前抛出，无部分写入。
+    /**
+     * 拉取 [forkHeight, head] 的完整新区段并在存储层原子提交（回滚 + 重放一次完成）。
+     * 任何缺失/异常都在提交前抛出，本地无部分写入。
+     */
+    private SyncResult commitFork(BlockSource src, ChainSnapshot snap, long before,
+                                  long forkHeight, long head,
+                                  List<SourceAttempt> attempts, int slot, SyncStatus status)
+            throws BlockSourceException {
         List<Block> incoming = new ArrayList<>();
         for (long h = forkHeight; h <= head; h++) {
             incoming.add(requireBlock(src, h));
@@ -177,27 +278,47 @@ public class BlockIndexer {
                 .orElseThrow(() -> new IllegalStateException(
                         "快照 CAS 提交失败：锁内不应发生，请检查存储实现"));
 
-        SyncStatus status = forkHeight <= before ? SyncStatus.REORGANIZED : SyncStatus.ADVANCED;
         attempts.set(slot, new SourceAttempt(src.name(), true, null,
                 "head=" + head + ", forkHeight=" + forkHeight));
 
-        if (status == SyncStatus.REORGANIZED) {
+        String msg;
+        if (status == SyncStatus.CHAIN_SWITCHED) {
+            log.info("等长链切换已提交：数据源={}，水位保持={}，回滚高度区间=[{}, {}]，"
+                            + "回滚哈希={}，重放哈希={}",
+                    src.name(), next.watermark(), forkHeight, before, rolledBack, applied);
+            msg = "源在同一高度 " + before + " 给出不同的链：在高度 " + forkHeight
+                    + " 分叉，已回滚 " + rolledBack.size() + " 个区块并重放 "
+                    + applied.size() + " 个新区块，水位保持 " + next.watermark();
+        } else if (status == SyncStatus.REORGANIZED) {
             log.info("链重组已提交：数据源={}，水位 {} -> {}，回滚高度区间=[{}, {}]，"
                             + "回滚哈希={}，重放哈希={}",
                     src.name(), before, next.watermark(), forkHeight, before, rolledBack, applied);
+            msg = "在高度 " + forkHeight + " 分叉，已回滚 " + rolledBack.size()
+                    + " 个区块并重放 " + applied.size() + " 个区块";
         } else {
             log.info("同步推进已提交：数据源={}，水位 {} -> {}，新增哈希={}",
                     src.name(), before, next.watermark(), applied);
+            msg = "新增 " + applied.size() + " 个区块";
         }
 
-        String msg = status == SyncStatus.REORGANIZED
-                ? "在高度 " + forkHeight + " 分叉，已回滚 " + rolledBack.size()
-                + " 个区块并重放 " + applied.size() + " 个区块"
-                : "新增 " + applied.size() + " 个区块";
         return new SyncResult(status, before, next.watermark(),
-                status == SyncStatus.REORGANIZED ? forkHeight : -1,
+                status == SyncStatus.ADVANCED ? -1 : forkHeight,
                 List.copyOf(rolledBack), List.copyOf(applied),
-                List.copyOf(attempts), msg);
+                finalizedAttempts(attempts), msg);
+    }
+
+    /**
+     * 生成最终逐源结论：成功返回时，排在其后、从未被尝试的源槽位仍为 null，
+     * 这里补上“未尝试”占位，保证结果中每个源都有可读结论且不含 null。
+     */
+    private List<SourceAttempt> finalizedAttempts(List<SourceAttempt> attempts) {
+        List<SourceAttempt> copy = new ArrayList<>(attempts.size());
+        for (int i = 0; i < attempts.size(); i++) {
+            SourceAttempt a = attempts.get(i);
+            copy.add(a != null ? a : new SourceAttempt(sources.get(i).name(), true, null,
+                    "未尝试：已有更高优先级的源给出结论"));
+        }
+        return List.copyOf(copy);
     }
 
     /**
